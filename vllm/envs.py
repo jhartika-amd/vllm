@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
+    VLLM_ROCM_USE_FLYDSL_SPARSE_DECODE: bool = False
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
@@ -1169,6 +1170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use FlyDSL sparse MLA decode on gfx942 (DeepSeek V4).
+    "VLLM_ROCM_USE_FLYDSL_SPARSE_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_USE_FLYDSL_SPARSE_DECODE", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.

@@ -2097,7 +2097,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
 
-    if not _ON_GFX950:  # Fallback path for un-tuned architectures.
+    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2219,6 +2219,273 @@ def _rocm_sparse_attn_decode_ragged_triton(
         SPLITS_PAD=triton.next_power_of_2(num_splits),
         num_warps=4,
     )
+    return out
+
+
+_FLYDSL_SPARSE_DECODE_AVAILABLE: bool | None = None
+
+
+def _flydsl_sparse_decode_available() -> bool:
+    global _FLYDSL_SPARSE_DECODE_AVAILABLE
+    if _FLYDSL_SPARSE_DECODE_AVAILABLE is None:
+        _FLYDSL_SPARSE_DECODE_AVAILABLE = (
+            envs.VLLM_ROCM_USE_FLYDSL_SPARSE_DECODE
+            and _ON_GFX942
+            and find_spec("aiter.ops.flydsl.kernels.pa_decode_sparse") is not None
+        )
+    return _FLYDSL_SPARSE_DECODE_AVAILABLE
+
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_pa_decode_sparse():
+    from aiter.ops.flydsl.kernels.pa_decode_sparse import flydsl_pa_decode_sparse
+
+    return flydsl_pa_decode_sparse
+
+
+def _merge_decode_ragged_indices(
+    main_indptr: torch.Tensor,
+    main_indices: torch.Tensor,
+    extra_indptr: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = main_indptr.device
+    num_queries = main_indptr.numel() - 1
+    has_extra = (
+        extra_indptr is not None
+        and extra_indices is not None
+        and extra_indices.numel() > 0
+    )
+    slot_chunks: list[torch.Tensor] = []
+    extra_chunks: list[torch.Tensor] = []
+    for t in range(num_queries):
+        m0, m1 = int(main_indptr[t]), int(main_indptr[t + 1])
+        if m1 > m0:
+            slot_chunks.append(main_indices[m0:m1])
+            extra_chunks.append(
+                torch.zeros(m1 - m0, dtype=torch.int8, device=device)
+            )
+        if has_extra:
+            assert extra_indptr is not None
+            assert extra_indices is not None
+            e0, e1 = int(extra_indptr[t]), int(extra_indptr[t + 1])
+            if e1 > e0:
+                slot_chunks.append(extra_indices[e0:e1])
+                extra_chunks.append(
+                    torch.ones(e1 - e0, dtype=torch.int8, device=device)
+                )
+    if slot_chunks:
+        workspace_slots = torch.cat(slot_chunks)
+        is_extra = torch.cat(extra_chunks)
+    else:
+        workspace_slots = torch.empty(0, dtype=torch.int32, device=device)
+        is_extra = torch.empty(0, dtype=torch.int8, device=device)
+    merged_lens = main_indptr[1:] - main_indptr[:-1]
+    if has_extra:
+        assert extra_indptr is not None
+        merged_lens = merged_lens + (extra_indptr[1:] - extra_indptr[:-1])
+    merged_indptr = torch.zeros(num_queries + 1, dtype=torch.int32, device=device)
+    torch.cumsum(merged_lens, dim=0, out=merged_indptr[1:])
+    kv_indices = torch.arange(
+        workspace_slots.numel(), dtype=torch.int32, device=device
+    )
+    return kv_indices, merged_indptr, workspace_slots, is_extra
+
+
+@triton.jit
+def _gather_fp8_ds_mla_kv_rows_kernel(
+    cache_ptr,
+    slots_ptr,
+    out_pos_ptr,
+    out_ptr,
+    cache_stride0,
+    block_size,
+    token_data_size,
+    scales_per_token,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+    OUT_DIM: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    slot = tl.load(slots_ptr + row_id)
+    out_pos = tl.load(out_pos_ptr + row_id)
+
+    block_idx = slot // block_size
+    pos_in_block = slot % block_size
+    cache_block_ptr = cache_ptr + block_idx.to(tl.int64) * cache_stride0
+    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+    token_scale_ptr = (
+        cache_block_ptr + block_size * token_data_size + pos_in_block * scales_per_token
+    )
+
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    nope_mask = nope_offsets < NOPE_DIM
+
+    x_uint8 = tl.load(
+        token_data_ptr + nope_offsets,
+        mask=nope_mask,
+        other=0,
+    )
+    if IS_FNUZ:
+        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+    else:
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+    encoded_scales = tl.load(
+        token_scale_ptr + nope_offsets // 64,
+        mask=nope_mask,
+        other=127,
+    )
+    scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+    k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+
+    rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    k_rope = tl.load(rope_ptr + rope_offsets)
+
+    out_row_ptr = out_ptr + out_pos.to(tl.int64) * OUT_DIM
+    tl.store(out_row_ptr + nope_offsets, k_nope, mask=nope_mask)
+    tl.store(out_row_ptr + NOPE_DIM + rope_offsets, k_rope)
+
+
+def _gather_fp8_ds_mla_kv_rows(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    out_positions: torch.Tensor,
+    out: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    *,
+    is_fnuz: bool,
+) -> None:
+    if slots.numel() == 0:
+        return
+    block_size = cache.shape[1]
+    token_data_size = nope_head_dim + rope_head_dim * 2
+    scales_per_token = nope_head_dim // 64
+    nope_block = triton.next_power_of_2(nope_head_dim)
+    head_dim = nope_head_dim + rope_head_dim
+    _gather_fp8_ds_mla_kv_rows_kernel[(slots.numel(),)](
+        cache,
+        slots,
+        out_positions,
+        out,
+        cache.stride(0),
+        block_size,
+        token_data_size,
+        scales_per_token,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=nope_block,
+        ROPE_DIM=rope_head_dim,
+        IS_FNUZ=is_fnuz,
+        OUT_DIM=head_dim,
+        num_warps=4,
+    )
+
+
+def _gather_decode_unified_kv_bf16(
+    main_cache: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+    workspace_slots: torch.Tensor,
+    is_extra: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+) -> torch.Tensor:
+    head_dim = nope_head_dim + rope_head_dim
+    unified_kv = torch.empty(
+        (workspace_slots.numel(), head_dim),
+        dtype=torch.bfloat16,
+        device=workspace_slots.device,
+    )
+    if workspace_slots.numel() == 0:
+        return unified_kv
+
+    positions = torch.arange(
+        workspace_slots.numel(), dtype=torch.int32, device=workspace_slots.device
+    )
+    main_mask = is_extra == 0
+    if main_mask.any():
+        _gather_fp8_ds_mla_kv_rows(
+            main_cache,
+            workspace_slots[main_mask],
+            positions[main_mask],
+            unified_kv,
+            nope_head_dim,
+            rope_head_dim,
+            is_fnuz=current_platform.is_fp8_fnuz(),
+        )
+    if extra_cache is not None and (~main_mask).any():
+        _gather_fp8_ds_mla_kv_rows(
+            extra_cache,
+            workspace_slots[~main_mask],
+            positions[~main_mask],
+            unified_kv,
+            nope_head_dim,
+            rope_head_dim,
+            is_fnuz=False,
+        )
+    return unified_kv
+
+
+def _pad_heads_for_flydsl(
+    q: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+    num_heads = q.shape[1]
+    pad_heads = (-num_heads) % 16
+    if pad_heads == 0:
+        return q, attn_sink, 0
+    q_pad = F.pad(q, (0, 0, 0, pad_heads))
+    if attn_sink is None:
+        return q_pad, None, pad_heads
+    sink_pad = torch.zeros(pad_heads, device=attn_sink.device, dtype=attn_sink.dtype)
+    return q_pad, torch.cat([attn_sink, sink_pad]), pad_heads
+
+
+def _rocm_sparse_attn_decode_flydsl(
+    q: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
+) -> torch.Tensor:
+    kv_indices, kv_indptr, workspace_slots, is_extra = _merge_decode_ragged_indices(
+        main_indptr,
+        main_indices,
+        extra_indptr,
+        extra_indices,
+    )
+    unified_kv = _gather_decode_unified_kv_bf16(
+        main_cache,
+        extra_cache,
+        workspace_slots,
+        is_extra,
+        nope_head_dim,
+        rope_head_dim,
+    )
+    q_fly, sink_fly, pad_heads = _pad_heads_for_flydsl(q, attn_sink)
+    if sink_fly is None:
+        sink_fly = torch.zeros(
+            q_fly.shape[1], device=q.device, dtype=torch.float32
+        )
+    flydsl_pa_decode_sparse = _get_flydsl_pa_decode_sparse()
+    out = flydsl_pa_decode_sparse(
+        q_fly,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        sink_fly,
+        scale,
+    )
+    if pad_heads:
+        out = out[:, : out.shape[1] - pad_heads, :]
     return out
 
 
@@ -2373,21 +2640,61 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    attn_out = _rocm_sparse_attn_decode_triton(
-        q=q,
-        main_cache=swa_k_cache,
-        main_indices=main_indices,
-        scale=scale,
-        attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
-        nope_head_dim=nope_head_dim,
-        rope_head_dim=rope_head_dim,
-        extra_cache=extra_cache,
-        extra_indices=extra_indices,
-        main_lengths=swa_lens,
-        extra_lengths=topk_lens,
-        main_ragged_indices=swa_ragged_indices,
-        main_ragged_indptr=swa_ragged_indptr,
-        extra_ragged_indices=topk_ragged_indices,
-        extra_ragged_indptr=topk_ragged_indptr,
-    )
+    sink = None if attn_sink is None else attn_sink[: q.shape[1]]
+    if _flydsl_sparse_decode_available():
+        if swa_ragged_indices is None or swa_ragged_indptr is None:
+            swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
+                main_indices,
+                swa_lens
+                if swa_lens is not None
+                else (main_indices >= 0).sum(dim=-1, dtype=torch.int32),
+                num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+            )
+        extra_ragged_indices_resolved = topk_ragged_indices
+        extra_ragged_indptr_resolved = topk_ragged_indptr
+        if (
+            (extra_ragged_indices_resolved is None or extra_ragged_indptr_resolved is None)
+            and extra_cache is not None
+            and extra_indices is not None
+        ):
+            extra_ragged_indices_resolved, extra_ragged_indptr_resolved = (
+                build_ragged_indices_from_dense(
+                    extra_indices,
+                    topk_lens
+                    if topk_lens is not None
+                    else (extra_indices >= 0).sum(dim=-1, dtype=torch.int32),
+                    num_rows=extra_cache.shape[0] * extra_cache.shape[1],
+                )
+            )
+        attn_out = _rocm_sparse_attn_decode_flydsl(
+            q=q,
+            main_cache=swa_k_cache,
+            main_indices=swa_ragged_indices,
+            main_indptr=swa_ragged_indptr,
+            scale=scale,
+            attn_sink=sink,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            extra_cache=extra_cache,
+            extra_indices=extra_ragged_indices_resolved,
+            extra_indptr=extra_ragged_indptr_resolved,
+        )
+    else:
+        attn_out = _rocm_sparse_attn_decode_triton(
+            q=q,
+            main_cache=swa_k_cache,
+            main_indices=main_indices,
+            scale=scale,
+            attn_sink=sink,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            main_lengths=swa_lens,
+            extra_lengths=topk_lens,
+            main_ragged_indices=swa_ragged_indices,
+            main_ragged_indptr=swa_ragged_indptr,
+            extra_ragged_indices=topk_ragged_indices,
+            extra_ragged_indptr=topk_ragged_indptr,
+        )
     output.copy_(attn_out.to(output.dtype))
