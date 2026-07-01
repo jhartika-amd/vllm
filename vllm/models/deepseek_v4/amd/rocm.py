@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
@@ -25,6 +26,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
+    ensure_flydsl_sparse_decode_buffers,
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
@@ -583,6 +585,23 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
 
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list[torch.cuda.Stream] | None = None,
+    ) -> None:
+        super().__init__(
+            vllm_config,
+            prefix,
+            topk_indices_buffer=topk_indices_buffer,
+            aux_stream_list=aux_stream_list,
+        )
+        # Cached for FlyDSL buffer warmup; get_current_vllm_config() is unset
+        # during profile_run / dummy forward.
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
@@ -631,6 +650,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             M = N + self.window_size + self.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )
+            ensure_flydsl_sparse_decode_buffers(
+                device=q.device,
+                head_dim=q.shape[-1],
+                num_heads=q.shape[1],
+                num_queries=self.max_num_seqs,
             )
             output.zero_()
             return

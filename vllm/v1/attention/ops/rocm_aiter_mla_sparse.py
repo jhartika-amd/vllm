@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+from dataclasses import dataclass
 from importlib.util import find_spec
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -2223,6 +2225,108 @@ def _rocm_sparse_attn_decode_ragged_triton(
 
 
 _FLYDSL_SPARSE_DECODE_AVAILABLE: bool | None = None
+# DSv4-Flash sparse decode bounds: sliding_window(128) + index_topk(512).
+_FLYDSL_DECODE_MAX_MERGED_LEN = 640
+
+
+@dataclass
+class _FlydslDecodeBuffers:
+    workspace_slots: torch.Tensor
+    is_extra: torch.Tensor
+    unified_kv: torch.Tensor
+    kv_scales: torch.Tensor
+    kv_indices: torch.Tensor
+    merged_indptr: torch.Tensor
+    attn_sink: torch.Tensor
+    max_nnz: int
+    max_queries: int
+
+
+_flydsl_decode_buffers: _FlydslDecodeBuffers | None = None
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_decode_query_cap() -> int | None:
+    """Max decode queries for FlyDSL buffers (one token per seq at decode)."""
+    try:
+        cfg = get_current_vllm_config()
+    except AssertionError:
+        return None
+    if cfg is None:
+        return None
+    return cfg.scheduler_config.max_num_seqs
+
+
+def ensure_flydsl_sparse_decode_buffers(
+    *,
+    device: torch.device,
+    head_dim: int,
+    num_heads: int,
+    num_queries: int = 0,
+) -> None:
+    """Pre-allocate persistent FlyDSL decode buffers for CUDA graph capture."""
+    if not _flydsl_sparse_decode_available():
+        return
+    _ensure_flydsl_decode_buffers(
+        device=device,
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_queries=num_queries,
+    )
+
+
+def _ensure_flydsl_decode_buffers(
+    *,
+    device: torch.device,
+    head_dim: int,
+    num_heads: int,
+    num_queries: int,
+) -> _FlydslDecodeBuffers:
+    global _flydsl_decode_buffers
+    query_cap = _flydsl_decode_query_cap()
+    if query_cap is not None:
+        num_queries = min(num_queries, query_cap)
+    prev_max_queries = (
+        _flydsl_decode_buffers.max_queries if _flydsl_decode_buffers is not None else 0
+    )
+    # Drop oversized buffers from earlier sizing mistakes (e.g. max_num_batched_tokens).
+    if query_cap is not None and prev_max_queries > query_cap:
+        _flydsl_decode_buffers = None
+        prev_max_queries = 0
+    max_queries = max(num_queries, prev_max_queries)
+    if query_cap is not None:
+        max_queries = min(max_queries, query_cap)
+    max_nnz = max_queries * _FLYDSL_DECODE_MAX_MERGED_LEN
+    pad_heads = (-num_heads) % 16
+    sink_heads = num_heads + pad_heads
+    fp8_dtype = current_platform.fp8_dtype()
+    num_scale_groups = head_dim // 64
+    if (
+        _flydsl_decode_buffers is None
+        or _flydsl_decode_buffers.max_nnz < max_nnz
+        or _flydsl_decode_buffers.max_queries < max_queries
+        or _flydsl_decode_buffers.unified_kv.shape[-1] != head_dim
+        or _flydsl_decode_buffers.kv_scales.shape[-1] != num_scale_groups
+        or _flydsl_decode_buffers.attn_sink.numel() < sink_heads
+    ):
+        _flydsl_decode_buffers = _FlydslDecodeBuffers(
+            workspace_slots=torch.zeros(max_nnz, dtype=torch.int32, device=device),
+            is_extra=torch.zeros(max_nnz, dtype=torch.int8, device=device),
+            unified_kv=torch.empty(
+                max_nnz, head_dim, dtype=fp8_dtype, device=device
+            ),
+            kv_scales=torch.empty(
+                max_nnz, num_scale_groups, dtype=torch.float32, device=device
+            ),
+            kv_indices=torch.arange(max_nnz, dtype=torch.int32, device=device),
+            merged_indptr=torch.zeros(
+                max_queries + 1, dtype=torch.int32, device=device
+            ),
+            attn_sink=torch.zeros(sink_heads, dtype=torch.float32, device=device),
+            max_nnz=max_nnz,
+            max_queries=max_queries,
+        )
+    return _flydsl_decode_buffers
 
 
 def _flydsl_sparse_decode_available() -> bool:
@@ -2243,53 +2347,99 @@ def _get_flydsl_pa_decode_sparse():
     return flydsl_pa_decode_sparse
 
 
+@triton.jit
+def _merge_decode_ragged_indices_kernel(
+    main_indptr_ptr,
+    main_indices_ptr,
+    extra_indptr_ptr,
+    extra_indices_ptr,
+    merged_indptr_ptr,
+    workspace_slots_ptr,
+    is_extra_ptr,
+    HAS_EXTRA: tl.constexpr,
+    MAX_MERGED_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+
+    main_start = tl.load(main_indptr_ptr + query_idx)
+    main_end = tl.load(main_indptr_ptr + query_idx + 1)
+    main_len = main_end - main_start
+
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+    else:
+        extra_start = 0
+        extra_end = 0
+    extra_len = extra_end - extra_start
+    total_len = main_len + extra_len
+
+    out_start = tl.load(merged_indptr_ptr + query_idx)
+    mask = offs < total_len
+
+    is_main = offs < main_len
+    is_extra_seg = (offs >= main_len) & mask
+
+    main_vals = tl.load(
+        main_indices_ptr + main_start + offs,
+        mask=is_main,
+        other=0,
+    )
+    extra_vals = tl.load(
+        extra_indices_ptr + extra_start + (offs - main_len),
+        mask=is_extra_seg,
+        other=0,
+    )
+    slots = tl.where(is_main, main_vals, extra_vals)
+    flags = tl.where(is_main, 0, 1).to(tl.int8)
+
+    tl.store(workspace_slots_ptr + out_start + offs, slots, mask=mask)
+    tl.store(is_extra_ptr + out_start + offs, flags, mask=mask)
+
+
 def _merge_decode_ragged_indices(
     main_indptr: torch.Tensor,
     main_indices: torch.Tensor,
     extra_indptr: torch.Tensor | None,
     extra_indices: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = main_indptr.device
+    workspace_slots: torch.Tensor,
+    is_extra: torch.Tensor,
+    merged_indptr: torch.Tensor,
+) -> None:
     num_queries = main_indptr.numel() - 1
     has_extra = (
         extra_indptr is not None
         and extra_indices is not None
         and extra_indices.numel() > 0
     )
-    slot_chunks: list[torch.Tensor] = []
-    extra_chunks: list[torch.Tensor] = []
-    for t in range(num_queries):
-        m0, m1 = int(main_indptr[t]), int(main_indptr[t + 1])
-        if m1 > m0:
-            slot_chunks.append(main_indices[m0:m1])
-            extra_chunks.append(
-                torch.zeros(m1 - m0, dtype=torch.int8, device=device)
-            )
-        if has_extra:
-            assert extra_indptr is not None
-            assert extra_indices is not None
-            e0, e1 = int(extra_indptr[t]), int(extra_indptr[t + 1])
-            if e1 > e0:
-                slot_chunks.append(extra_indices[e0:e1])
-                extra_chunks.append(
-                    torch.ones(e1 - e0, dtype=torch.int8, device=device)
-                )
-    if slot_chunks:
-        workspace_slots = torch.cat(slot_chunks)
-        is_extra = torch.cat(extra_chunks)
-    else:
-        workspace_slots = torch.empty(0, dtype=torch.int32, device=device)
-        is_extra = torch.empty(0, dtype=torch.int8, device=device)
+
     merged_lens = main_indptr[1:] - main_indptr[:-1]
     if has_extra:
         assert extra_indptr is not None
         merged_lens = merged_lens + (extra_indptr[1:] - extra_indptr[:-1])
-    merged_indptr = torch.zeros(num_queries + 1, dtype=torch.int32, device=device)
+
+    merged_indptr.zero_()
     torch.cumsum(merged_lens, dim=0, out=merged_indptr[1:])
-    kv_indices = torch.arange(
-        workspace_slots.numel(), dtype=torch.int32, device=device
-    )
-    return kv_indices, merged_indptr, workspace_slots, is_extra
+
+    if num_queries > 0:
+        block = 128
+        extra_indptr_arg = extra_indptr if has_extra else main_indptr
+        extra_indices_arg = extra_indices if has_extra else main_indices
+        _merge_decode_ragged_indices_kernel[(num_queries, triton.cdiv(_FLYDSL_DECODE_MAX_MERGED_LEN, block))](
+            main_indptr,
+            main_indices,
+            extra_indptr_arg,
+            extra_indices_arg,
+            merged_indptr,
+            workspace_slots,
+            is_extra,
+            HAS_EXTRA=has_extra,
+            MAX_MERGED_LEN=_FLYDSL_DECODE_MAX_MERGED_LEN,
+            BLOCK=block,
+        )
 
 
 @triton.jit
@@ -2349,6 +2499,230 @@ def _gather_fp8_ds_mla_kv_rows_kernel(
     tl.store(out_row_ptr + NOPE_DIM + rope_offsets, k_rope)
 
 
+@triton.jit
+def _gather_fp8_ds_mla_kv_rows_dual_kernel(
+    main_cache_ptr,
+    extra_cache_ptr,
+    slots_ptr,
+    is_extra_ptr,
+    out_ptr,
+    kv_indptr_ptr,
+    num_queries,
+    main_cache_stride0,
+    extra_cache_stride0,
+    block_size,
+    token_data_size,
+    scales_per_token,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ_MAIN: tl.constexpr,
+    OUT_DIM: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    active_nnz = tl.load(kv_indptr_ptr + num_queries)
+    if row_id >= active_nnz:
+        return
+    slot = tl.load(slots_ptr + row_id)
+    if HAS_EXTRA:
+        use_extra = tl.load(is_extra_ptr + row_id) != 0
+    else:
+        use_extra = False
+
+    block_idx = slot // block_size
+    pos_in_block = slot % block_size
+
+    main_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+    extra_block_ptr = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+    cache_block_ptr = tl.where(use_extra, extra_block_ptr, main_block_ptr)
+
+    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+    token_scale_ptr = (
+        cache_block_ptr + block_size * token_data_size + pos_in_block * scales_per_token
+    )
+
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    nope_mask = nope_offsets < NOPE_DIM
+
+    x_uint8 = tl.load(
+        token_data_ptr + nope_offsets,
+        mask=nope_mask,
+        other=0,
+    )
+    if IS_FNUZ_MAIN:
+        x_fp8_main = x_uint8.to(tl.float8e4b8, bitcast=True)
+    else:
+        x_fp8_main = x_uint8.to(tl.float8e4nv, bitcast=True)
+    x_fp8_extra = x_uint8.to(tl.float8e4nv, bitcast=True)
+    x_fp8 = tl.where(use_extra, x_fp8_extra, x_fp8_main)
+
+    encoded_scales = tl.load(
+        token_scale_ptr + nope_offsets // 64,
+        mask=nope_mask,
+        other=127,
+    )
+    scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+    k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+
+    rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    k_rope = tl.load(rope_ptr + rope_offsets)
+
+    out_row_ptr = out_ptr + row_id.to(tl.int64) * OUT_DIM
+    tl.store(out_row_ptr + nope_offsets, k_nope, mask=nope_mask)
+    tl.store(out_row_ptr + NOPE_DIM + rope_offsets, k_rope)
+
+
+@triton.jit
+def _gather_decode_unified_kv_fp8_dual_kernel(
+    main_cache_ptr,
+    extra_cache_ptr,
+    slots_ptr,
+    is_extra_ptr,
+    out_ptr,
+    scales_ptr,
+    kv_indptr_ptr,
+    num_queries,
+    main_cache_stride0,
+    extra_cache_stride0,
+    block_size,
+    token_data_size,
+    scales_per_token,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ_MAIN: tl.constexpr,
+    OUT_DIM: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    NOPE_GROUPS: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    active_nnz = tl.load(kv_indptr_ptr + num_queries)
+    if row_id >= active_nnz:
+        return
+    slot = tl.load(slots_ptr + row_id)
+    if HAS_EXTRA:
+        use_extra = tl.load(is_extra_ptr + row_id) != 0
+    else:
+        use_extra = False
+
+    block_idx = slot // block_size
+    pos_in_block = slot % block_size
+
+    main_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+    extra_block_ptr = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+    cache_block_ptr = tl.where(use_extra, extra_block_ptr, main_block_ptr)
+
+    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+    token_scale_ptr = (
+        cache_block_ptr + block_size * token_data_size + pos_in_block * scales_per_token
+    )
+    rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+
+    out_row_ptr = out_ptr + row_id.to(tl.int64) * OUT_DIM
+    scales_row_ptr = scales_ptr + row_id.to(tl.int64) * N_GROUPS
+    group_offs = tl.arange(0, 64)
+
+    for g in tl.static_range(N_GROUPS):
+        out_offs = g * 64 + group_offs
+        if g < NOPE_GROUPS:
+            nope_offs = out_offs
+            nope_mask = nope_offs < NOPE_DIM
+            x_uint8 = tl.load(
+                token_data_ptr + nope_offs,
+                mask=nope_mask,
+                other=0,
+            )
+            if IS_FNUZ_MAIN:
+                x_fp8_main = x_uint8.to(tl.float8e4b8, bitcast=True)
+            else:
+                x_fp8_main = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_fp8_extra = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_fp8 = tl.where(use_extra, x_fp8_extra, x_fp8_main)
+
+            encoded_scale = tl.load(token_scale_ptr + g)
+            embed_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+
+            # SWA FNUZ rows can pass cache fp8 + embedded scale through; topk
+            # OCP rows must be requantized to platform fp8 for FlyDSL.
+            if use_extra or not IS_FNUZ_MAIN:
+                vals = x_fp8.to(tl.float32) * embed_scale
+                absmax = tl.max(tl.abs(vals))
+                scale = tl.maximum(absmax, 1e-4) / FP8_MAX
+                fp8_out = (vals / scale).to(tl.float8e4b8)
+                tl.store(out_row_ptr + out_offs, fp8_out, mask=nope_mask)
+                tl.store(scales_row_ptr + g, scale)
+            else:
+                tl.store(out_row_ptr + out_offs, x_fp8, mask=nope_mask)
+                tl.store(scales_row_ptr + g, embed_scale)
+        else:
+            rope_vals = tl.load(rope_ptr + group_offs).to(tl.float32)
+            absmax = tl.max(tl.abs(rope_vals))
+            scale = tl.maximum(absmax, 1e-4) / FP8_MAX
+            fp8_out = (rope_vals / scale).to(tl.float8e4b8)
+            tl.store(out_row_ptr + out_offs, fp8_out)
+            tl.store(scales_row_ptr + g, scale)
+
+
+def _gather_decode_unified_kv_fp8(
+    main_cache: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+    workspace_slots: torch.Tensor,
+    is_extra: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    num_queries: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    *,
+    max_nnz: int,
+) -> None:
+    if max_nnz == 0 or num_queries == 0:
+        return
+
+    has_extra = extra_cache is not None
+    extra_cache_arg = extra_cache if has_extra else main_cache
+    block_size = main_cache.shape[1]
+    token_data_size = nope_head_dim + rope_head_dim * 2
+    scales_per_token = nope_head_dim // 64
+    nope_block = triton.next_power_of_2(nope_head_dim)
+    head_dim = nope_head_dim + rope_head_dim
+    is_fnuz_main = current_platform.is_fp8_fnuz()
+    fp8_dtype = current_platform.fp8_dtype()
+    fp8_max = 224.0 if fp8_dtype == torch.float8_e4m3fnuz else 448.0
+    n_groups = head_dim // 64
+    nope_groups = nope_head_dim // 64
+    _gather_decode_unified_kv_fp8_dual_kernel[(max_nnz,)](
+        main_cache,
+        extra_cache_arg,
+        workspace_slots,
+        is_extra,
+        unified_kv,
+        kv_scales,
+        kv_indptr,
+        num_queries,
+        main_cache.stride(0),
+        extra_cache_arg.stride(0),
+        block_size,
+        token_data_size,
+        scales_per_token,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=nope_block,
+        ROPE_DIM=rope_head_dim,
+        IS_FNUZ_MAIN=is_fnuz_main,
+        OUT_DIM=head_dim,
+        N_GROUPS=n_groups,
+        NOPE_GROUPS=nope_groups,
+        FP8_MAX=fp8_max,
+        HAS_EXTRA=has_extra,
+        num_warps=4,
+    )
+
+
 def _gather_fp8_ds_mla_kv_rows(
     cache: torch.Tensor,
     slots: torch.Tensor,
@@ -2389,43 +2763,48 @@ def _gather_decode_unified_kv_bf16(
     extra_cache: torch.Tensor | None,
     workspace_slots: torch.Tensor,
     is_extra: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    num_queries: int,
     nope_head_dim: int,
     rope_head_dim: int,
-) -> torch.Tensor:
-    head_dim = nope_head_dim + rope_head_dim
-    unified_kv = torch.empty(
-        (workspace_slots.numel(), head_dim),
-        dtype=torch.bfloat16,
-        device=workspace_slots.device,
-    )
-    if workspace_slots.numel() == 0:
-        return unified_kv
+    *,
+    max_nnz: int,
+) -> None:
+    if max_nnz == 0 or num_queries == 0:
+        return
 
-    positions = torch.arange(
-        workspace_slots.numel(), dtype=torch.int32, device=workspace_slots.device
+    has_extra = extra_cache is not None
+    extra_cache_arg = extra_cache if has_extra else main_cache
+    block_size = main_cache.shape[1]
+    token_data_size = nope_head_dim + rope_head_dim * 2
+    scales_per_token = nope_head_dim // 64
+    nope_block = triton.next_power_of_2(nope_head_dim)
+    head_dim = nope_head_dim + rope_head_dim
+    is_fnuz_main = current_platform.is_fp8_fnuz()
+    # Fixed launch grid for CUDA graph capture; inactive rows exit early using
+    # kv_indptr[num_queries] loaded on device.
+    _gather_fp8_ds_mla_kv_rows_dual_kernel[(max_nnz,)](
+        main_cache,
+        extra_cache_arg,
+        workspace_slots,
+        is_extra,
+        unified_kv,
+        kv_indptr,
+        num_queries,
+        main_cache.stride(0),
+        extra_cache_arg.stride(0),
+        block_size,
+        token_data_size,
+        scales_per_token,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=nope_block,
+        ROPE_DIM=rope_head_dim,
+        IS_FNUZ_MAIN=is_fnuz_main,
+        OUT_DIM=head_dim,
+        HAS_EXTRA=has_extra,
+        num_warps=4,
     )
-    main_mask = is_extra == 0
-    if main_mask.any():
-        _gather_fp8_ds_mla_kv_rows(
-            main_cache,
-            workspace_slots[main_mask],
-            positions[main_mask],
-            unified_kv,
-            nope_head_dim,
-            rope_head_dim,
-            is_fnuz=current_platform.is_fp8_fnuz(),
-        )
-    if extra_cache is not None and (~main_mask).any():
-        _gather_fp8_ds_mla_kv_rows(
-            extra_cache,
-            workspace_slots[~main_mask],
-            positions[~main_mask],
-            unified_kv,
-            nope_head_dim,
-            rope_head_dim,
-            is_fnuz=False,
-        )
-    return unified_kv
 
 
 def _pad_heads_for_flydsl(
@@ -2456,33 +2835,64 @@ def _rocm_sparse_attn_decode_flydsl(
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    kv_indices, kv_indptr, workspace_slots, is_extra = _merge_decode_ragged_indices(
+    num_queries = q.shape[0]
+    head_dim = nope_head_dim + rope_head_dim
+    buffers = _ensure_flydsl_decode_buffers(
+        device=q.device,
+        head_dim=head_dim,
+        num_heads=q.shape[1],
+        num_queries=num_queries,
+    )
+
+    workspace_slots = buffers.workspace_slots
+    is_extra = buffers.is_extra
+    kv_indptr = buffers.merged_indptr[: num_queries + 1]
+    _merge_decode_ragged_indices(
         main_indptr,
         main_indices,
         extra_indptr,
         extra_indices,
+        workspace_slots,
+        is_extra,
+        kv_indptr,
     )
-    unified_kv = _gather_decode_unified_kv_bf16(
+
+    _gather_decode_unified_kv_fp8(
         main_cache,
         extra_cache,
         workspace_slots,
         is_extra,
+        buffers.unified_kv,
+        buffers.kv_scales,
+        kv_indptr,
+        num_queries,
         nope_head_dim,
         rope_head_dim,
+        max_nnz=buffers.max_nnz,
     )
+
     q_fly, sink_fly, pad_heads = _pad_heads_for_flydsl(q, attn_sink)
+    sink_out = buffers.attn_sink[: q_fly.shape[1]]
     if sink_fly is None:
-        sink_fly = torch.zeros(
-            q_fly.shape[1], device=q.device, dtype=torch.float32
-        )
+        sink_out.zero_()
+    else:
+        sink_out.copy_(sink_fly, non_blocking=True)
+    sink_fly = sink_out
+
     flydsl_pa_decode_sparse = _get_flydsl_pa_decode_sparse()
+    # DSv4 sparse decode has at most ~640 KV rows/query (128 SWA + 512 topk).
+    # Force kv_splits=1 so AITER uses the direct-output path (KV_SPLITS==1).
+    # Default auto-selection uses kv_indices.shape[0] (our max_nnz buffer length,
+    # e.g. 40960) and picks dozens of splits + a Triton reduce every step.
     out = flydsl_pa_decode_sparse(
         q_fly,
-        unified_kv,
-        kv_indices,
+        buffers.unified_kv,
+        buffers.kv_indices,
         kv_indptr,
         sink_fly,
         scale,
+        kv_scales=buffers.kv_scales,
+        kv_splits=1,
     )
     if pad_heads:
         out = out[:, : out.shape[1] - pad_heads, :]
