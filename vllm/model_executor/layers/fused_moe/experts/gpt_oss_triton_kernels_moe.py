@@ -742,6 +742,115 @@ def triton_kernel_fused_experts(
     return output_tensor
 
 
+@triton.jit
+def _decode_routing_meta_fused(
+    TopkIds,  # [n_gates] int16/int32, row-major (row*top_k + j); -1 == invalid
+    ColSum,  # [n_cols_padded] int32 out  (== slice_sizes / expert histogram)
+    ColSortedIndx,  # [n_gates] int32 out (combine_indx)
+    RowSortedIndx,  # [n_gates] int32 out (dispatch_indx)
+    n_gates,  # runtime int
+    num_experts,  # runtime int (num_local_experts; gates only reference < this)
+    n_cols_padded,  # runtime int (== len(ColSum); trailing experts get 0)
+    BLOCK_G: tl.constexpr,  # pow2 >= n_gates
+    BLOCK_E: tl.constexpr,  # pow2 >= n_cols_padded
+):
+    """Single-program fused replacement for the decode routing-metadata trio.
+
+    Reproduces, bit-exactly, the outputs the baseline path derives from
+    ``pack_bitmatrix`` + ``sum_bitmatrix_rows`` +
+    ``_bitmatrix_metadata_compute_stage1`` + ``_stage2_pow2`` for small
+    ``n_gates`` (decode):
+
+      * ``ColSum[e]``          = #valid gates routed to expert ``e``
+      * ``ColSortedIndx[p]``   = gate index at sorted position ``p`` (``-1`` pad)
+      * ``RowSortedIndx[g]``   = sorted rank of gate ``g`` (``-1`` if invalid)
+
+    Ordering is lexicographic by ``(expert_id, gate_index)`` -- identical to the
+    baseline, which sorts ``(col_indx << 16) | offs`` and offsets by an exclusive
+    per-expert prefix sum. Every output address is written by exactly one lane,
+    so there are no cross-lane memset/scatter races.
+
+    Only valid for ``n_gates <= BLOCK_G`` and ``n_cols_padded <= BLOCK_E`` (a
+    single 32-row-block regime), which the caller enforces before dispatch.
+    """
+    g = tl.arange(0, BLOCK_G)
+    gmask = g < n_gates
+    eid = tl.load(TopkIds + g, mask=gmask, other=-1).to(tl.int32)
+    valid = gmask & (eid >= 0)
+
+    # col_sum: expert histogram over valid gates (2D equality reduce)
+    e = tl.arange(0, BLOCK_E)
+    eq = (eid[None, :] == e[:, None]) & valid[None, :]
+    col_sum = tl.sum(eq.to(tl.int32), axis=1)
+    tl.store(ColSum + e, col_sum, mask=e < n_cols_padded)
+
+    # row_sorted_indx: lexicographic rank of each gate, per-gate (no race).
+    # key(g) = (expert << 16) | g  -> strict-less gives the global sort rank.
+    kg = (eid << 16) | g
+    lt = (kg[None, :] < kg[:, None]) & valid[None, :]
+    dest = tl.sum(lt.to(tl.int32), axis=1)
+    tl.store(RowSortedIndx + g, tl.where(valid, dest, -1), mask=gmask)
+
+    # col_sorted_indx: inverse permutation via sort (full coverage)
+    key = tl.where(valid, ((eid.to(tl.uint32)) << 16) | g.to(tl.uint32), 0xFFFFFFFF)
+    key_sorted = tl.sort(key, 0)
+    valid_s = key_sorted != 0xFFFFFFFF
+    g_s = (key_sorted & 0xFFFF).to(tl.int32)
+    tl.store(ColSortedIndx + g, tl.where(valid_s, g_s, -1), mask=gmask)
+
+
+def _decode_fastpath_routing(
+    topk_ids: torch.Tensor,  # int16 [n_rows, top_k], contiguous, -1 == invalid
+    topk_weights: torch.Tensor,  # bf16 [n_rows, top_k], -1.0 at invalid slots
+    num_local_experts: int,
+    num_topk: int,
+) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+    """Decode fast-path for make_routing_data.
+
+    Builds routing metadata in ``1 fused kernel + make_ragged_tensor_metadata``
+    instead of ``pack_bitmatrix + 3 bitmatrix-metadata kernels + ragged``.
+    matmul_ogs never reads the Bitmatrix object (only the ragged metadata and the
+    gather/scatter indices), so at decode we compute col_sum/col_sorted_indx/
+    row_sorted_indx directly from topk_ids and skip the bitmatrix entirely.
+    """
+    device = topk_ids.device
+    n_gates = topk_ids.numel()
+    n_cols_padded = ((num_local_experts + 31) // 32) * 32
+
+    col_sum = torch.empty(n_cols_padded, dtype=torch.int32, device=device)
+    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    col_sorted_indx = combined_indx[:n_gates]
+    row_sorted_indx = combined_indx[n_gates:]
+
+    _decode_routing_meta_fused[(1,)](
+        topk_ids,
+        col_sum,
+        col_sorted_indx,
+        row_sorted_indx,
+        n_gates,
+        num_local_experts,
+        n_cols_padded,
+        BLOCK_G=triton.next_power_of_2(n_gates),
+        BLOCK_E=triton.next_power_of_2(n_cols_padded),
+    )
+
+    ragged_batch_metadata = make_ragged_tensor_metadata(
+        col_sum,
+        row_sorted_indx.shape[0],
+    )
+    gate_scal = topk_weights.flatten()[col_sorted_indx]
+    routing_data = RoutingData(
+        gate_scal,
+        ragged_batch_metadata.block_sizes,
+        num_local_experts,
+        num_topk,
+        ragged_batch_metadata,
+    )
+    gather_indx = GatherIndx(col_sorted_indx, row_sorted_indx)
+    scatter_indx = ScatterIndx(row_sorted_indx, col_sorted_indx)
+    return routing_data, gather_indx, scatter_indx
+
+
 def make_routing_data(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -751,6 +860,30 @@ def make_routing_data(
     topk_weights = topk_weights.to(torch.bfloat16)
 
     n_rows, num_topk = topk_ids.size()
+
+    # Decode fast-path: for small gate counts (decode) skip pack_bitmatrix + the
+    # bitmatrix-metadata trio and build the routing structures directly in a
+    # single fused kernel (numerically identical). Gated behind
+    # VLLM_DSV4_DECODE_ROUTING_FASTPATH (default off); only the v3.6+
+    # SparseMatrix API is supported (the legacy path has its own routing()).
+    if (
+        not use_legacy_triton_kernels
+        and os.environ.get("VLLM_DSV4_DECODE_ROUTING_FASTPATH", "0") == "1"
+    ):
+        n_gates = n_rows * num_topk
+        _max_gates = int(
+            os.environ.get("VLLM_DSV4_DECODE_ROUTING_FASTPATH_MAX_GATES", "256")
+        )
+        if 0 < n_gates <= _max_gates:
+            # matmul_ogs expects invalid topk_weights to be -1s (matches the
+            # baseline transform applied below on the slow path).
+            topk_weights = torch.where(topk_ids == -1, -1.0, topk_weights)
+            return _decode_fastpath_routing(
+                topk_ids.contiguous(),
+                topk_weights.contiguous(),
+                num_local_experts,
+                num_topk,
+            )
 
     # pack_bitmatrix is hard-coded to tile with BLOCK_SIZE_M=512. At decode the
     # router only has a handful of rows (n_rows == scheduled tokens), so a single
