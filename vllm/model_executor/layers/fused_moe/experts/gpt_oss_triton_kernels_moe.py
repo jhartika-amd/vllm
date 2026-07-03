@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -750,7 +752,18 @@ def make_routing_data(
 
     n_rows, num_topk = topk_ids.size()
 
-    BLOCK_SIZE_M = 512
+    # pack_bitmatrix is hard-coded to tile with BLOCK_SIZE_M=512. At decode the
+    # router only has a handful of rows (n_rows == scheduled tokens), so a single
+    # 512-row program reduces over a mostly-empty tile and costs ~34us for one
+    # real row. BLOCK_SIZE_M only controls how rows are partitioned across
+    # programs -- the packed bitmatrix is byte-identical for any value -- so when
+    # VLLM_DSV4_PACK_BM_BLOCK_M is set we cap the tile to the actual row count
+    # (rounded up to a power of 2, min 8). Unset preserves the original 512.
+    _bm_cap = int(os.environ.get("VLLM_DSV4_PACK_BM_BLOCK_M", "512"))
+    if _bm_cap != 512:
+        BLOCK_SIZE_M = min(_bm_cap, max(8, triton.next_power_of_2(n_rows)))
+    else:
+        BLOCK_SIZE_M = 512
     BLOCK_SIZE_K = 32
 
     bm_cols = triton.cdiv(num_local_experts, BLOCK_SIZE_K)  # n_bitpacks
