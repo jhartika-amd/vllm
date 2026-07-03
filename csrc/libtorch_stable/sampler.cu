@@ -8,6 +8,10 @@
   #include <hipcub/hipcub.hpp>
 #endif
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
 namespace vllm {
 
 template <typename scalar_t>
@@ -658,6 +662,82 @@ void apply_repetition_penalties_(
       });
 }
 
+// Maximum number of cooperating blocks per row for the split (two-step) decode
+// top-k path. Bounds the merge-pass work (factor * topK candidates) and the
+// size of the auxiliary buffers.
+static constexpr int kMaxSplitBlocksPerRow = 10;
+
+// Reads the VLLM_TOPK_DECODE_SPLIT_FACTOR override once.
+//   unset / "auto" / "-1"  -> -1 (occupancy-adaptive, the default)
+//   "0" / "off"            ->  0 (force single-block-per-row, legacy behavior)
+//   N >= 1                 ->  N (force this many blocks per row, capped later)
+static int readDecodeSplitOverride() {
+  const char* env = std::getenv("VLLM_TOPK_DECODE_SPLIT_FACTOR");
+  if (env == nullptr || env[0] == '\0') return -1;
+  if (std::strcmp(env, "auto") == 0) return -1;
+  if (std::strcmp(env, "off") == 0) return 0;
+  char* end = nullptr;
+  long v = std::strtol(env, &end, 10);
+  if (end == env) return -1;  // unparseable -> auto
+  if (v < 0) return -1;
+  return static_cast<int>(v);
+}
+
+// Chooses how many blocks cooperate on each row's top-k. The original kernel
+// launched exactly one block per row in the radix regime, so at decode (where
+// numRows == batch * next_n is small) the grid launches far fewer blocks than
+// the GPU has CUs and most of the device sits idle while each block serially
+// scans a long logits row. This splits each row across multiple blocks (the
+// existing multipleBlocksPerRow + merge path) so the grid fills the GPU, and
+// preserves the prior heavy split for very long sequences.
+static int decodeSplitFactor(int64_t numColumns, int64_t numRows, int64_t topK,
+                             int splitWorkThreshold, int deviceIndex) {
+  static const int kOverride = readDecodeSplitOverride();
+  if (kOverride == 0) return 1;  // explicitly disabled
+
+  // Below this column count the per-row scan is short enough that the extra
+  // merge pass (a second top-k over splitFactor*topK candidates) costs more than
+  // it saves, so splitting is a net loss (measured on gfx942 microbench).
+  constexpr int kMinSplitColumns = 96 * 1024;
+
+  // Don't over-split beyond available work: each sub-block should own a range
+  // comfortably larger than topK, otherwise the sub-block does little useful
+  // work and the extra merge pass is pure overhead.
+  const int maxByWork = static_cast<int>(
+      numColumns / std::max<int64_t>(1, 2 * topK));
+  const int cap = std::min(kMaxSplitBlocksPerRow, std::max(1, maxByWork));
+
+  if (kOverride > 0) {
+    return std::max(1, std::min(kOverride, cap));
+  }
+
+  static int numCUs = [&] {
+    int cus = 0;
+    cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, deviceIndex);
+    return cus > 0 ? cus : 304;  // MI3xx fallback
+  }();
+
+  // Occupancy-fill factor. Uses floor division so that once numRows alone is
+  // enough to keep the device busy the factor collapses to 1 (no split): extra
+  // blocks past ~one-per-CU only add merge overhead on an already HBM-bound
+  // kernel.
+  const int fill = numRows > 0 ? static_cast<int>(numCUs / numRows) : numCUs;
+  const int factor = std::min(cap, std::max(1, fill));
+
+  if (numColumns < splitWorkThreshold) {
+    // Radix regime. Only split when the row scan is long enough to amortize the
+    // merge AND the un-split grid leaves the GPU underutilized; otherwise the
+    // kernel is bandwidth-bound and splitting just adds work.
+    if (numColumns < kMinSplitColumns) return 1;
+    if (numRows * 2 > numCUs) return 1;
+    return factor;
+  }
+
+  // Very long sequences: split to cut per-row scan latency, backing off (via the
+  // floor above) when many rows already fill the device.
+  return factor;
+}
+
 void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           const torch::stable::Tensor& seqLens,
                           torch::stable::Tensor& indices, int64_t numRows,
@@ -667,6 +747,8 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
   constexpr int kNumThreadsPerBlock = 512;
   const cudaStream_t stream = get_current_cuda_stream();
   const auto numColumns = logits.size(1);
+
+  if (numRows <= 0) return;
 
   // True if seqLens is 2D (B, next_n): each logit row has its own pre-computed
   // effective seq_len. False if seqLens is 1D (B,): all rows in a batch share
@@ -681,43 +763,51 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
             indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
             static_cast<int>(stride1), static_cast<int>(topK),
             static_cast<int>(next_n), seqLensIs2D);
-  } else if (numColumns < kSplitWorkThreshold) {
-    // From this threshold, use radix sort instead
+    return;
+  }
+
+  // Radix regime. Decide how many blocks cooperate per row so the grid fills
+  // the GPU even when numRows (the decode batch) is small.
+  const int splitFactor = decodeSplitFactor(
+      numColumns, numRows, topK, kSplitWorkThreshold,
+      logits.get_device_index());
+
+  if (splitFactor <= 1) {
+    // Single block per row (legacy path).
     vllm::topKPerRowDecode<kNumThreadsPerBlock, true>
         <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
             logits.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
             indices.mutable_data_ptr<int>(), static_cast<int>(stride0),
             static_cast<int>(stride1), static_cast<int>(topK),
             static_cast<int>(next_n), seqLensIs2D);
-  } else {
-    // Long sequences are run in two steps
-    constexpr auto multipleBlocksPerRowConfig = 10;
-
-    const auto outIndicesAux = torch::stable::empty(
-        {numRows, multipleBlocksPerRowConfig, topK},
-        torch::headeronly::ScalarType::Int, std::nullopt, logits.device());
-    const auto outLogitsAux = torch::stable::empty(
-        {numRows, multipleBlocksPerRowConfig, topK},
-        torch::headeronly::ScalarType::Float, std::nullopt, logits.device());
-
-    vllm::topKPerRowDecode<kNumThreadsPerBlock, true, true>
-        <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock,
-           2 * topK * sizeof(int32_t), stream>>>(
-            logits.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
-            outIndicesAux.mutable_data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n), seqLensIs2D,
-            outLogitsAux.mutable_data_ptr<float>());
-
-    constexpr int kNumThreadsPerBlockMerge = 1024;
-    vllm::topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
-        <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(
-            outLogitsAux.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
-            indices.mutable_data_ptr<int>(), multipleBlocksPerRowConfig * topK,
-            1, static_cast<int>(topK), static_cast<int>(next_n), seqLensIs2D,
-            nullptr, multipleBlocksPerRowConfig,
-            outIndicesAux.const_data_ptr<int>());
+    return;
   }
+
+  // Two-step split path: `splitFactor` blocks each produce a partial top-k over
+  // a contiguous slice of the row, then a merge pass selects the global top-k.
+  const auto outIndicesAux = torch::stable::empty(
+      {numRows, splitFactor, topK}, torch::headeronly::ScalarType::Int,
+      std::nullopt, logits.device());
+  const auto outLogitsAux = torch::stable::empty(
+      {numRows, splitFactor, topK}, torch::headeronly::ScalarType::Float,
+      std::nullopt, logits.device());
+
+  vllm::topKPerRowDecode<kNumThreadsPerBlock, true, true>
+      <<<dim3(numRows, splitFactor), kNumThreadsPerBlock,
+         2 * topK * sizeof(int32_t), stream>>>(
+          logits.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
+          outIndicesAux.mutable_data_ptr<int>(), static_cast<int>(stride0),
+          static_cast<int>(stride1), static_cast<int>(topK),
+          static_cast<int>(next_n), seqLensIs2D,
+          outLogitsAux.mutable_data_ptr<float>());
+
+  constexpr int kNumThreadsPerBlockMerge = 1024;
+  vllm::topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
+      <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(
+          outLogitsAux.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
+          indices.mutable_data_ptr<int>(), splitFactor * static_cast<int>(topK),
+          1, static_cast<int>(topK), static_cast<int>(next_n), seqLensIs2D,
+          nullptr, splitFactor, outIndicesAux.const_data_ptr<int>());
 }
 
 void top_k_per_row_prefill(const torch::stable::Tensor& logits,
