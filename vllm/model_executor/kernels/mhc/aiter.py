@@ -124,6 +124,78 @@ def _mhc_post_aiter_fake(
     return torch.empty_like(residual)
 
 
+def mhc_fused_post_pre_aiter(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused mHC post + next-pre via aiter.
+
+    Wraps ``aiter.ops.mhc.mhc_fused_post_pre`` (force_fused left False so the
+    fused HIP kernel is used only in the decode regime, m < 128 on gfx942, and
+    the unfused post+pre is used for large m). aiter returns
+    ``(post_mix, comb_mix, layer_input_out, next_residual)``; vLLM's
+    MHCFusedPostPreOp contract is ``(residual_cur, post_mix, comb_mix,
+    layer_input)`` so the tuple is reordered here.
+    """
+    hidden_size = residual.shape[-1]
+    assert hidden_size % 256 == 0
+    from aiter.ops.mhc import mhc_fused_post_pre
+
+    post_mix, comb_mix, layer_input_out, next_residual = mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return next_residual, post_mix, comb_mix, layer_input_out
+
+
+def _mhc_fused_post_pre_aiter_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual.shape[0]
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    next_residual = torch.empty_like(residual)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=torch.float32, device=residual.device)
+    comb_mix = torch.empty(
+        m, hc_mult, hc_mult, dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        m, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    return next_residual, post_mix, comb_mix, layer_input
+
+
 direct_register_custom_op(
     op_name="mhc_pre_aiter",
     op_func=mhc_pre_aiter,
@@ -135,4 +207,10 @@ direct_register_custom_op(
     op_func=mhc_post_aiter,
     mutates_args=[],
     fake_impl=_mhc_post_aiter_fake,
+)
+direct_register_custom_op(
+    op_name="mhc_fused_post_pre_aiter",
+    op_func=mhc_fused_post_pre_aiter,
+    mutates_args=[],
+    fake_impl=_mhc_fused_post_pre_aiter_fake,
 )

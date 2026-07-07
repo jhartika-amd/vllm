@@ -323,9 +323,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.use_fused_mhc = HAS_TILELANG_MHC and not (
+        # Use the fused post+pre path whenever a fused kernel is available:
+        # aiter ships a gfx942-tuned mhc_fused_post_pre (fused HIP kernel in the
+        # decode regime m<128), and tilelang provides one on CUDA / non-gfx942
+        # ROCm. Verified gfx942-parity + a measured decode win vs the unfused
+        # separate aiter pre/post (analyze/_bench_mhc_fused_post_pre.py).
+        self.use_fused_mhc = (
             HAS_AITER_MHC and self.hidden_size % 256 == 0
-        )
+        ) or HAS_TILELANG_MHC
 
     def hc_pre(
         self,

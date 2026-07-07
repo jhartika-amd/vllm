@@ -455,6 +455,26 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_size = residual.shape[-1]
+        if HAS_AITER_MHC and hidden_size % 256 == 0:
+            # aiter's mhc_fused_post_pre uses the fused HIP kernel in the decode
+            # regime (m < 128 on gfx942) and falls back to the unfused
+            # post+pre for large m. Verified gfx942-parity vs the separate
+            # aiter pre/post path (analyze/_bench_mhc_fused_post_pre.py).
+            return torch.ops.vllm.mhc_fused_post_pre_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
         if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,
