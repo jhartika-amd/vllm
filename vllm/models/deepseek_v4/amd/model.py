@@ -50,9 +50,15 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
+# WS2 (shared-expert fusion): load-time FP8(block)->MXFP4 re-quant helper.
+from vllm.models.deepseek_v4.amd.fp8_to_mxfp4_shared import (
+    convert_shared_fp8_to_mxfp4,
+)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -160,7 +166,15 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
-        if config.n_shared_experts is None:
+        # WS1 — shared-expert fusion (mechanism B, router-append). When the
+        # AITER fusion flag is on, the shared expert is NOT built as a separate
+        # FP8 MLP; instead it is folded into the routed MXFP4 grouped-GEMM as
+        # appended expert slot(s) [n_routed .. n_routed+n_shared). Its weights
+        # are re-quantized FP8->MXFP4 at load time (WS2, see load_weights).
+        self.is_fusion_moe_shared_experts_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
+        if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -198,6 +212,11 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            n_shared_experts=(
+                config.n_shared_experts
+                if self.is_fusion_moe_shared_experts_enabled
+                else None
+            ),
         )
 
     def forward(
@@ -627,7 +646,24 @@ class DeepseekV4Model(nn.Module):
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
 
+        # WS2 — shared-expert fusion: intercept the FP8 shared-expert weights,
+        # re-quantize them to MXFP4 at load time, and route them into the
+        # appended routed-expert slots. Buffer weight+scale until both halves of
+        # a projection are seen (they arrive as separate checkpoint entries).
+        fuse_shared = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        shared_expert_buf: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+
         for name, loaded_weight in weights:
+            if fuse_shared and ".shared_experts." in name:
+                self._load_fused_shared_expert(
+                    name,
+                    loaded_weight,
+                    shared_expert_buf,
+                    params_dict,
+                    expert_mapping,
+                    loaded_params,
+                )
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -705,13 +741,94 @@ class DeepseekV4Model(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # WS2: when the shared expert is fused, it occupies the appended slots
+        # [n_routed .. n_routed+n_shared); include them so the mapping resolves
+        # the synthesized shared-expert names to those expert params.
+        num_experts = self.config.n_routed_experts
+        if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+            num_experts += self.config.n_shared_experts or 0
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
+            num_experts=num_experts,
         )
+
+    # Post-mapper shared-expert token -> routed-expert shard id.
+    # (the hf_to_vllm mapper renames the checkpoint's shared `w2` -> `down_proj`)
+    _SHARED_PROJ_TO_SHARD = {"w1": "w1", "w3": "w3", "down_proj": "w2"}
+
+    def _load_fused_shared_expert(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        buf: dict[tuple[str, str], dict[str, torch.Tensor]],
+        params_dict: dict[str, torch.nn.Parameter],
+        expert_mapping: list[tuple[str, str, int, str]],
+        loaded_params: set[str],
+    ) -> None:
+        """WS2 — fold one FP8 shared-expert tensor into the MXFP4 routed slots.
+
+        The shared expert stores each projection as an FP8 block-scale
+        ``weight`` + ``weight_scale_inv`` pair. We buffer both, then convert
+        FP8->MXFP4 and hand the packed weight + E8M0 scale to the routed-expert
+        ``weight_loader`` for the appended slot ``n_routed_experts (+ j)``,
+        reusing the exact same mapping the routed experts use.
+        """
+        # Which projection + which half (weight vs block scale)?
+        proj = next(
+            (p for p in self._SHARED_PROJ_TO_SHARD if f".shared_experts.{p}." in name),
+            None,
+        )
+        if proj is None:
+            return  # e.g. an unexpected shared-expert param; leave unhandled
+        if name.endswith(".weight_scale_inv"):
+            half = "scale"
+        elif name.endswith(".weight"):
+            half = "weight"
+        else:
+            return
+
+        prefix = name.split(".shared_experts.")[0]
+        key = (prefix, proj)
+        slot = buf.setdefault(key, {})
+        slot[half] = loaded_weight
+        if "weight" not in slot or "scale" not in slot:
+            return  # wait for the other half
+
+        # Both halves present -> convert FP8(block) -> MXFP4 (packed + E8M0).
+        packed, scale = convert_shared_fp8_to_mxfp4(slot["weight"], slot["scale"])
+        del buf[key]
+
+        shard_id = self._SHARED_PROJ_TO_SHARD[proj]
+        # n_shared_experts == 1 for DSv4-Flash -> single appended slot.
+        expert_id = self.config.n_routed_experts
+        base = f"{prefix}.experts.{expert_id}.{shard_id}"
+
+        for tensor, suffix in ((packed, "weight"), (scale, "weight_scale")):
+            synth = f"{base}.{suffix}"
+            for param_name, weight_name, mapped_expert_id, mapped_shard_id in (
+                expert_mapping
+            ):
+                if weight_name not in synth or mapped_expert_id != expert_id:
+                    continue
+                name_mapped = synth.replace(weight_name, param_name)
+                if is_pp_missing_parameter(name_mapped, self):
+                    break
+                param = params_dict[name_mapped]
+                weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+                success = weight_loader(
+                    param,
+                    tensor,
+                    name_mapped,
+                    shard_id=mapped_shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
+                if success:
+                    loaded_params.add(name_mapped)
+                break
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
