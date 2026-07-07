@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
+    HAS_AITER_MHC,
     HAS_TILELANG_MHC,
     HCHeadOp,
     MHCFusedPostPreOp,
@@ -322,7 +323,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.has_tilelang = HAS_TILELANG_MHC
+        # Use the fused post+pre path whenever a fused kernel is available:
+        # aiter ships a gfx942-tuned mhc_fused_post_pre (fused HIP kernel in the
+        # decode regime m<128), and tilelang provides one on CUDA / non-gfx942
+        # ROCm. Verified gfx942-parity + a measured decode win vs the unfused
+        # separate aiter pre/post (analyze/_bench_mhc_fused_post_pre.py).
+        self.use_fused_mhc = (
+            HAS_AITER_MHC and self.hidden_size % 256 == 0
+        ) or HAS_TILELANG_MHC
 
     def hc_pre(
         self,
@@ -444,7 +452,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if not self.has_tilelang:
+        if not self.use_fused_mhc:
             return self._forward_unfused_post_pre(
                 x, positions, input_ids, post_mix, res_mix, residual
             )
@@ -532,7 +540,9 @@ class DeepseekV4Model(nn.Module):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
-        self.has_tilelang = HAS_TILELANG_MHC
+        self.use_fused_mhc = (
+            HAS_AITER_MHC and self.config.hidden_size % 256 == 0
+        ) or HAS_TILELANG_MHC
         # Pre-hc_head residual stream buffer for the MTP draft. Stable
         # address (outside the cudagraph pool) so the copy_ in forward()
         # refreshes it correctly across captured shapes.
@@ -599,7 +609,7 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        if layer is not None and self.has_tilelang:
+        if layer is not None and self.use_fused_mhc:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
