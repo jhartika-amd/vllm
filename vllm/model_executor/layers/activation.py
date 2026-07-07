@@ -180,12 +180,44 @@ class SiluAndMulWithClamp(CustomOp):
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        # [PHASE3-B2 overlay] On ROCm the base build has no fused
+        # silu_and_mul_with_clamp op (torch.ops._C.silu_and_mul_with_clamp is
+        # not compiled), so it falls back to eager forward_native -> a chain of
+        # clamp/sigmoid/mul at::native kernels (~0.5 ms / decode step for the
+        # DSv4 shared expert, per the with-stack profile). aiter ships a fused
+        # module_activation.silu_and_mul(out, x, limit) that is bit-parity (to
+        # bf16 ULP) with forward_native for the plain-silu case (alpha=1,
+        # beta=0) -- verified in analyze/_bench_shared_expert_act.py, and the
+        # routed experts already use aiter's swiglu_limit clamp in this model.
+        # Only take the fused path for that degenerate case; anything else
+        # (SwiGLU-OAI alpha!=1 / beta!=0) stays on the exact native math.
+        self._aiter_silu_and_mul = None
+        if current_platform.is_rocm():
+            if self.alpha == 1.0 and self.beta == 0.0:
+                try:
+                    from aiter.ops.activation import (
+                        silu_and_mul as _aiter_silu_and_mul,
+                    )
+
+                    self._aiter_silu_and_mul = _aiter_silu_and_mul
+                    self._forward_method = self.forward_rocm_aiter
+                except Exception:
+                    self._forward_method = self.forward_native
+            else:
+                self._forward_method = self.forward_native
+        elif current_platform.is_xpu():
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul_with_clamp
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
+
+    def forward_rocm_aiter(self, x: torch.Tensor) -> torch.Tensor:
+        # [PHASE3-B2 overlay] fused aiter SwiGLU-with-clamp (alpha=1, beta=0).
+        d = x.shape[-1] // 2
+        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+        self._aiter_silu_and_mul(out, x, self.swiglu_limit)
+        return out
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
