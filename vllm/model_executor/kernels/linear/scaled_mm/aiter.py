@@ -27,6 +27,33 @@ from .ScaledMMLinearKernel import (
 
 logger = init_logger(__name__)
 
+# [PHASE3-E8M0-CACHE overlay] The FP8 block-scaled MM upcasts its E8M0 weight
+# scale (Bs) to fp32 on *every* call via _upcast_e8m0_to_fp32 -> a standalone
+# aten::__lshift__ kernel (~1.0 ms / decode step, ~5.5/layer, per the with-stack
+# decode profile). The weight scale is a static parameter, so this fp32 result
+# is identical every step -- pure redundant per-step recompute. Memoize it by
+# the weight-scale tensor's data_ptr (parameter address is stable across the
+# life of the process and across cudagraph replays), so the upcast fires once
+# (during warmup, before capture) and every subsequent GEMM reuses the cached
+# fp32 buffer. The activation scale (As) is dynamic and is NOT cached.
+_E8M0_WS_FP32_CACHE: dict[int, torch.Tensor] = {}
+
+
+def _cached_upcast_e8m0_weight_scale(bs: torch.Tensor) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        _upcast_e8m0_to_fp32,
+    )
+
+    key = bs.data_ptr()
+    cached = _E8M0_WS_FP32_CACHE.get(key)
+    # Guard against the (unlikely) case of a different tensor reusing a freed
+    # address with a changed shape.
+    if cached is not None and cached.shape == bs.shape:
+        return cached
+    upcast = _upcast_e8m0_to_fp32(bs).contiguous()
+    _E8M0_WS_FP32_CACHE[key] = upcast
+    return upcast
+
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     @classmethod
@@ -416,7 +443,9 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 As = As.to(torch.float32)
 
             if Bs.dtype == torch.float8_e8m0fnu:
-                Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+                # [PHASE3-E8M0-CACHE overlay] static weight scale -> memoized
+                # fp32 upcast (was a per-call aten::__lshift__).
+                Bs = _cached_upcast_e8m0_weight_scale(Bs)
             else:
                 Bs = Bs.to(torch.float32)
 
