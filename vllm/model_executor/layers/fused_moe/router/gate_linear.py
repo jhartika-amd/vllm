@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os as _os
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -10,6 +12,28 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+# --- Gate-logits fused cast (Phase 3 Lever-B.3) ----------------------------
+# On ROCm the CUDA-only fast tiers (1-3) in GateLinear.forward are all disabled
+# (they are gated on current_platform.is_cuda()), so DSv4 falls to Tier 4:
+# a bf16 F.linear followed by a SEPARATE `output.to(torch.float32)` cast to make
+# the fp32 router logits the sqrtsoftplus gating consumes. That trailing cast is
+# the standalone `aten::copy_` (dtype cast bf16->fp32, ~0.22 ms / ~50 launches
+# per decode step) attributed to gate_linear.py:forward in the with-stack glue
+# profile. Folding it into the GEMM epilogue -- one bf16 x @ bf16 W.T with
+# out_dtype=fp32 (rocBLAS accumulates straight to fp32) -- removes the extra
+# kernel. This mirrors the CUDA-only Tier 3 (cuBLAS bf16->fp32) but runs on
+# ROCm/hipBLAS. Flag-gated so the fold is trivially A/B-testable and falls back
+# to the stock Tier 4 path when off.
+def _use_gate_fused_cast() -> bool:
+    return _os.environ.get("VLLM_DSV4_GATE_FUSED_CAST", "0").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
 @PluggableLayer.register("gate_linear")
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
@@ -18,6 +42,9 @@ class GateLinear(ReplicatedLinear):
     2. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out,
        M<=32, H=3072, E=256)
     3. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    3b. ROCm fused-cast GEMM (bf16×bf16→fp32 via torch.mm out_dtype; folds the
+        router-logits dtype cast into the GEMM epilogue). Flag-gated on
+        VLLM_DSV4_GATE_FUSED_CAST.
     4. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -99,6 +126,17 @@ class GateLinear(ReplicatedLinear):
             and self.out_dtype == torch.float32
         )
 
+        # ROCm fused-cast GEMM eligibility (prototype, Phase 3 Lever-B.3):
+        # bf16 weight + fp32 out_dtype + no bias, and the CUDA fast tiers are
+        # unavailable (i.e. we would otherwise fall to Tier 4 + a trailing cast).
+        # The runtime x.dtype == bf16 check stays in forward().
+        self.allow_rocm_fused_cast_router_gemm = (
+            not bias
+            and not self.allow_specialized_router_gemm
+            and self.weight.dtype == torch.bfloat16
+            and self.out_dtype == torch.float32
+        )
+
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
         """Set output dtype for the router logits after init.
 
@@ -115,6 +153,14 @@ class GateLinear(ReplicatedLinear):
             and out_dtype == torch.float32
         ):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
+
+        # Keep the ROCm fused-cast eligibility in sync when out_dtype is set late.
+        if (
+            not self.allow_specialized_router_gemm
+            and self.weight.dtype == torch.bfloat16
+            and out_dtype == torch.float32
+        ):
+            self.allow_rocm_fused_cast_router_gemm = True
 
     def forward(
         self, x: torch.Tensor
@@ -140,6 +186,19 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 3: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            return output, None
+
+        # Tier 3b (prototype): ROCm fused-cast GEMM. Fold the router-logits
+        # bf16->fp32 cast into the GEMM epilogue (single rocBLAS bf16 x @ bf16
+        # W.T accumulating to fp32), removing the standalone Tier 4 `output.to(
+        # fp32)` copy (~0.22 ms / decode step). Flag-gated; identical math to
+        # Tier 4 (fp32-accumulated bf16 matmul), just without the extra kernel.
+        if (
+            _use_gate_fused_cast()
+            and self.allow_rocm_fused_cast_router_gemm
+            and x.dtype == torch.bfloat16
+        ):
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
