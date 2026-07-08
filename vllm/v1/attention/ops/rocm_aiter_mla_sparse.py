@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import importlib
 import math
 from importlib.util import find_spec
@@ -538,6 +539,20 @@ def mqa_logits_module():
     return None
 
 
+@functools.lru_cache
+def _flydsl_mqa_logits_fn():
+    if os.environ.get("AITER_FP8_MQA_LOGITS_FLYDSL", "0") != "1":
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+        return flydsl_fp8_mqa_logits
+    except Exception:
+        return None
+
+
+_FLYDSL_MQA_LOGITS_LOGGED = False
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -568,6 +583,16 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     k_fp8, scale = kv
+
+    if rocm_aiter_ops.is_enabled():
+        flydsl_fn = _flydsl_mqa_logits_fn()
+        if flydsl_fn is not None:
+            global _FLYDSL_MQA_LOGITS_LOGGED
+            if not _FLYDSL_MQA_LOGITS_LOGGED:
+                from vllm.logger import init_logger
+                init_logger(__name__).info("rocm_fp8_mqa_logits: using FlyDSL gfx942 indexer")
+                _FLYDSL_MQA_LOGITS_LOGGED = True
+            return flydsl_fn(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
 
     # Temporarily route gfx942 to the vendored ROCm/aiter#3257 workaround.
     # Remove this branch once vLLM bumps AITER to a version that includes
@@ -2097,7 +2122,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
 
-    if not _ON_GFX950:  # Fallback path for un-tuned architectures.
+    if not (_ON_GFX942 or _ON_GFX950):  # Fallback for un-tuned archs.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,

@@ -358,6 +358,12 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            from vllm.platforms.rocm import on_gfx942
+            if on_gfx942():
+                layer.w13_weight.is_gfx942_fp4_bf16 = True
+                layer.w2_weight.is_gfx942_fp4_bf16 = True
+                layer.w13_weight_scale.is_gfx942_fp4_bf16 = True
+                layer.w2_weight_scale.is_gfx942_fp4_bf16 = True
 
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
@@ -705,6 +711,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            from vllm.platforms.rocm import on_gfx942
+            if on_gfx942():
+                layer.w13_weight.is_gfx942_fp4_bf16 = True
+                layer.w2_weight.is_gfx942_fp4_bf16 = True
+                layer.w13_weight_scale.is_gfx942_fp4_bf16 = True
+                layer.w2_weight_scale.is_gfx942_fp4_bf16 = True
 
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
