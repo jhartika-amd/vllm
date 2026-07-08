@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -642,6 +643,43 @@ def rocm_aiter_sparse_attn_indexer_fake(
     return topk_indices_buffer
 
 
+# FlyDSL tiered decode TopK (K=512) — gated indexer top-512 select. Mirrors the
+# FlyDSL mqa-logits path: the kernel ships in the aiter FlyDSL branch
+# (aiter.ops.flydsl); it is flat ~20us/call vs the _C linear-scan
+# topKPerRowDecode<512> ~63us at long context. Off by default; enable with
+# VLLM_DSV4_FLYDSL_TOPK=1. VLLM_DSV4_FLYDSL_TOPK_MIN_LEN gates on the indexer
+# column count (the ~20us floor loses below the crossover). Falls back to the
+# _C kernel when disabled, unavailable, K!=512, or context too short. The
+# selection is an unordered top-512 set (set-equivalent to _C).
+@functools.lru_cache
+def _flydsl_topk_decode_fn():
+    if os.environ.get("VLLM_DSV4_FLYDSL_TOPK", "0").lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_top_k_per_row_decode
+
+        return flydsl_top_k_per_row_decode
+    except Exception:
+        return None
+
+
+@functools.lru_cache
+def _flydsl_topk_min_len() -> int:
+    try:
+        return int(os.environ.get("VLLM_DSV4_FLYDSL_TOPK_MIN_LEN", "40000"))
+    except ValueError:
+        return 40000
+
+
+_FLYDSL_TOPK_LOGGED = False
+
+
 @eager_break_during_capture
 def rocm_aiter_sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -829,16 +867,39 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
+        flydsl_topk = (
+            _flydsl_topk_decode_fn() if topk_tokens == 512 else None
         )
+        if flydsl_topk is not None and logits.shape[1] >= _flydsl_topk_min_len():
+            global _FLYDSL_TOPK_LOGGED
+            if not _FLYDSL_TOPK_LOGGED:
+                from vllm.logger import init_logger
+
+                init_logger(__name__).info(
+                    "top_k_per_row_decode: using FlyDSL tiered gfx942 kernel"
+                )
+                _FLYDSL_TOPK_LOGGED = True
+            flydsl_topk(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk_tokens,
+            )
+        else:
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
