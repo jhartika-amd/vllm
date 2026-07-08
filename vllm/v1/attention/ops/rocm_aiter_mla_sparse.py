@@ -2410,6 +2410,298 @@ def rocm_sparse_attn_prefill(
     output.copy_(output_chunk.to(output.dtype))
 
 
+# --- FlyDSL fused sparse-decode attention (Phase 1) --------------------------
+# Routes the ROCm sparse paged-decode (MLA) attention to the fused FlyDSL kernel
+# `flydsl_pa_decode_sparse_fused`, shipped as the standalone `flydsl_padecode`
+# package on PYTHONPATH (mirrors the flydsl_topk Phase-1a packaging; needs the
+# `flydsl` runtime). The fused kernel reads the two paged fp8_ds_mla caches
+# (SWA FNUZ + top-k OCP) + ragged CSR directly, merging + dequant + Q-quant
+# in-kernel, so it is a near drop-in for _rocm_sparse_attn_decode_ragged_triton.
+# Flag-gated (VLLM_DSV4_FLYDSL_DECODE=1); falls back to the Triton split-K path
+# on import failure. gfx942/gfx950 only (fp8 MFMA + FNUZ/OCP dual-cache read).
+_FLYDSL_FUSED_DECODE_FN = None
+_FLYDSL_FUSED_DECODE_TRIED = False
+
+# Force the native FlyDSL bf16 split-K reducer for the fused decode path. The
+# generic Triton reduce (the wrapper's default at T<8) is unavailable in this
+# image (its _pa_decode_sparse_reduce rejects the USE_EXP2 kwarg), so split-K
+# (kv_splits>1) MUST use the kernel's own bf16 reducer. setdefault so an explicit
+# yaml env still wins.
+os.environ.setdefault("VLLM_FLYDSL_BF16_PARTIALS", "1")
+
+# gfx942 CU count for the split-K occupancy target (matches the kernel wrapper).
+_FLYDSL_DECODE_NUM_CUS = 304
+
+
+def _flydsl_decode_kv_splits(num_tokens: int, num_head_blocks: int) -> int:
+    """Pick a cudagraph-safe split-K factor from the decode batch geometry only.
+
+    Depends solely on (num_tokens, num_head_blocks) — both constant within a
+    cudagraph batch bucket — so each bucket JIT-compiles its kv_splits-keyed
+    kernel + reducer variant ONCE during warmup, never during capture. (The
+    wrapper's own kv_splits=None heuristic also factors nnz, which varies per
+    step and would risk compile-during-capture, so we compute it here instead.)
+
+    At low concurrency (T=1) a single (token, head-block) CTA otherwise serializes
+    the whole layer's ~40 KV tiles on one CU; split-K fans it across CUs (~7x at
+    conc1, kv_len~640). Scales back to 1 as base CTAs approach the CU count.
+    """
+    base_ctas = max(1, num_tokens * num_head_blocks)
+    occ = max(1, _FLYDSL_DECODE_NUM_CUS // base_ctas)
+    ks = 1 << (occ.bit_length() - 1)   # round down to power of two
+    return max(1, min(32, ks))
+
+
+def _flydsl_fused_decode_fn():
+    global _FLYDSL_FUSED_DECODE_FN, _FLYDSL_FUSED_DECODE_TRIED
+    if not _FLYDSL_FUSED_DECODE_TRIED:
+        _FLYDSL_FUSED_DECODE_TRIED = True
+        from vllm.logger import init_logger
+
+        try:
+            from flydsl_padecode import flydsl_pa_decode_sparse_fused as _fn
+
+            _FLYDSL_FUSED_DECODE_FN = _fn
+            init_logger(__name__).info(
+                "[flydsl-decode] FlyDSL fused sparse-decode path available"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _FLYDSL_FUSED_DECODE_FN = None
+            init_logger(__name__).warning(
+                "[flydsl-decode] import failed, falling back to Triton: %r", exc
+            )
+    return _FLYDSL_FUSED_DECODE_FN
+
+
+def _use_flydsl_fused_decode() -> bool:
+    if os.environ.get("VLLM_DSV4_FLYDSL_DECODE", "0").lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }:
+        return False
+    if not (_ON_GFX942 or _ON_GFX950):
+        return False
+    return _flydsl_fused_decode_fn() is not None
+
+
+def _pad_heads_for_flydsl_decode(q, attn_sink):
+    num_heads = q.shape[1]
+    pad_heads = (-num_heads) % 16
+    if pad_heads == 0:
+        return q, attn_sink, 0
+    q_pad = F.pad(q, (0, 0, 0, pad_heads))
+    if attn_sink is None:
+        return q_pad, None, pad_heads
+    sink_pad = torch.zeros(pad_heads, device=attn_sink.device, dtype=attn_sink.dtype)
+    return q_pad, torch.cat([attn_sink, sink_pad]), pad_heads
+
+
+def _rocm_sparse_attn_decode_flydsl_fused(
+    q,
+    main_cache,
+    main_ragged_indices,
+    main_ragged_indptr,
+    scale,
+    attn_sink,
+    nope_head_dim,
+    rope_head_dim,
+    extra_cache=None,
+    extra_ragged_indices=None,
+    extra_ragged_indptr=None,
+):
+    fn = _flydsl_fused_decode_fn()
+    num_queries = q.shape[0]
+    # The fused kernel always reads a dual cache in one pass. For SWA-only decode
+    # pass an empty top-k segment aliased to main_cache (extra_len == 0 per row).
+    if (
+        extra_cache is None
+        or extra_ragged_indices is None
+        or extra_ragged_indptr is None
+    ):
+        extra_cache = main_cache
+        extra_ragged_indices = torch.empty(0, dtype=torch.int32, device=q.device)
+        extra_ragged_indptr = torch.zeros(
+            num_queries + 1, dtype=torch.int32, device=q.device
+        )
+
+    q_fly, sink_fly, pad_heads = _pad_heads_for_flydsl_decode(q, attn_sink)
+    q_fly = q_fly.contiguous()
+    # The KV_SPLITS==1 path reads attn_sink per head; the kernel needs a real
+    # tensor even when the model has no sink.
+    if sink_fly is None:
+        sink_fly = torch.zeros(
+            q_fly.shape[1], dtype=torch.float32, device=q_fly.device
+        )
+    else:
+        sink_fly = sink_fly.to(torch.float32).contiguous()
+
+    # Split-K factor from the (padded) decode geometry. Constant per cudagraph
+    # bucket -> the S{k} kernel + bf16 reducer compile once during warmup. At
+    # conc1 this fans the ~40 KV tiles of each layer across CUs instead of
+    # pinning them to a single CTA (measured ~7x on the isolated kernel).
+    num_head_blocks = q_fly.shape[1] // 16
+    kv_splits = _flydsl_decode_kv_splits(q_fly.shape[0], num_head_blocks)
+    out = fn(
+        q_fly,
+        main_cache,
+        extra_cache,
+        main_ragged_indices,
+        main_ragged_indptr,
+        extra_ragged_indices,
+        extra_ragged_indptr,
+        sink_fly,
+        scale,
+        nope_dim=nope_head_dim,
+        block_size=main_cache.shape[1],
+        # Split-K (>1 at low conc) + the native FlyDSL bf16 reducer
+        # (VLLM_FLYDSL_BF16_PARTIALS=1, set at import): no Triton reduce
+        # dependency, and cudagraph-safe because kv_splits is fixed per bucket.
+        kv_splits=kv_splits,
+    )
+    if pad_heads:
+        out = out[:, : out.shape[1] - pad_heads, :]
+    return out
+
+
+# --- Unified-KV sparse-decode adapter (Phase 1, A/B alternative) -------------
+# Routes the ROCm sparse paged-decode (MLA) attention through the GENERIC aiter
+# Triton kernel `pa_decode_sparse` (unified_kv pool, page_size=1) instead of the
+# fused FlyDSL kernel. A standalone `unified_padecode` package (mounted on
+# PYTHONPATH, mirrors flydsl_padecode) gathers + dequantizes the two paged
+# fp8_ds_mla caches into one compact bf16 unified_kv + identity kv_indices +
+# merged kv_indptr, then calls pa_decode_sparse. This re-introduces the
+# pre-gather pass the fused kernel avoids (slower, more HBM), but reuses the
+# well-tested generic kernel and is a useful bf16 parity oracle.
+# Flag-gated (VLLM_DSV4_UNIFIED_PA_DECODE=1); falls back to Triton on failure.
+_UNIFIED_PA_DECODE_FN = None
+_UNIFIED_PA_DECODE_TRIED = False
+
+
+def _unified_pa_decode_fn():
+    global _UNIFIED_PA_DECODE_FN, _UNIFIED_PA_DECODE_TRIED
+    if not _UNIFIED_PA_DECODE_TRIED:
+        _UNIFIED_PA_DECODE_TRIED = True
+        from vllm.logger import init_logger
+
+        try:
+            from unified_padecode import run_unified_pa_decode as _fn
+
+            _UNIFIED_PA_DECODE_FN = _fn
+            init_logger(__name__).info(
+                "[unified-pa-decode] unified_kv sparse-decode path available"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _UNIFIED_PA_DECODE_FN = None
+            init_logger(__name__).warning(
+                "[unified-pa-decode] import failed, falling back to Triton: %r", exc
+            )
+    return _UNIFIED_PA_DECODE_FN
+
+
+def _use_unified_pa_decode() -> bool:
+    if os.environ.get("VLLM_DSV4_UNIFIED_PA_DECODE", "0").lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }:
+        return False
+    if not (_ON_GFX942 or _ON_GFX950):
+        return False
+    return _unified_pa_decode_fn() is not None
+
+
+def _resolve_decode_ragged(
+    main_indices,
+    swa_ragged_indices,
+    swa_ragged_indptr,
+    swa_lens,
+    swa_k_cache,
+    extra_cache,
+    extra_indices,
+    topk_ragged_indices,
+    topk_ragged_indptr,
+    topk_lens,
+):
+    """Build the ragged CSR (flat valid slots + prefix-sum indptr) for both
+    caches from the dense per-row slots when not pre-raggedized. Shared by the
+    FlyDSL fused and unified-KV decode branches."""
+    if swa_ragged_indices is None or swa_ragged_indptr is None:
+        swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
+            main_indices,
+            swa_lens
+            if swa_lens is not None
+            else (main_indices >= 0).sum(dim=-1, dtype=torch.int32),
+            num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+        )
+    extra_ri = topk_ragged_indices
+    extra_rp = topk_ragged_indptr
+    if (
+        (extra_ri is None or extra_rp is None)
+        and extra_cache is not None
+        and extra_indices is not None
+    ):
+        extra_ri, extra_rp = build_ragged_indices_from_dense(
+            extra_indices,
+            topk_lens
+            if topk_lens is not None
+            else (extra_indices >= 0).sum(dim=-1, dtype=torch.int32),
+            num_rows=extra_cache.shape[0] * extra_cache.shape[1],
+        )
+    return swa_ragged_indices, swa_ragged_indptr, extra_ri, extra_rp
+
+
+def _rocm_sparse_attn_decode_unified_pa(
+    q,
+    main_cache,
+    main_ragged_indices,
+    main_ragged_indptr,
+    scale,
+    attn_sink,
+    nope_head_dim,
+    rope_head_dim,
+    extra_cache=None,
+    extra_ragged_indices=None,
+    extra_ragged_indptr=None,
+):
+    fn = _unified_pa_decode_fn()
+    num_queries = q.shape[0]
+    # Unified path always reads a dual cache; for SWA-only decode alias an empty
+    # top-k segment to main_cache (extra_len == 0 per row).
+    if (
+        extra_cache is None
+        or extra_ragged_indices is None
+        or extra_ragged_indptr is None
+    ):
+        extra_cache = main_cache
+        extra_ragged_indices = torch.empty(0, dtype=torch.int32, device=q.device)
+        extra_ragged_indptr = torch.zeros(
+            num_queries + 1, dtype=torch.int32, device=q.device
+        )
+    is_fnuz = current_platform.is_fp8_fnuz()
+    return fn(
+        q.contiguous(),
+        main_cache,
+        extra_cache,
+        main_ragged_indices,
+        main_ragged_indptr,
+        extra_ragged_indices,
+        extra_ragged_indptr,
+        attn_sink,
+        scale,
+        nope_dim=nope_head_dim,
+        rope_dim=rope_head_dim,
+        # main_cache = SWA K-cache (C++ encoder, FNUZ on gfx942 / OCP on gfx950).
+        # extra_cache = compressed KV cache (Triton encoder, OCP everywhere).
+        is_fnuz_main=is_fnuz,
+        is_fnuz_extra=False,
+    )
+
+
 def rocm_sparse_attn_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
@@ -2458,21 +2750,110 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    attn_out = _rocm_sparse_attn_decode_triton(
-        q=q,
-        main_cache=swa_k_cache,
-        main_indices=main_indices,
-        scale=scale,
-        attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
-        nope_head_dim=nope_head_dim,
-        rope_head_dim=rope_head_dim,
-        extra_cache=extra_cache,
-        extra_indices=extra_indices,
-        main_lengths=swa_lens,
-        extra_lengths=topk_lens,
-        main_ragged_indices=swa_ragged_indices,
-        main_ragged_indptr=swa_ragged_indptr,
-        extra_ragged_indices=topk_ragged_indices,
-        extra_ragged_indptr=topk_ragged_indptr,
-    )
+    global _FLYDSL_FUSED_DECODE_FN, _UNIFIED_PA_DECODE_FN
+    sink = None if attn_sink is None else attn_sink[: q.shape[1]]
+    attn_out = None
+
+    use_unified = _use_unified_pa_decode()
+    use_flydsl = _use_flydsl_fused_decode()
+
+    # Both the unified-KV and FlyDSL fused paths consume ragged CSR indices;
+    # resolve them once (shared) from the dense per-row slots if not prebuilt.
+    extra_ragged_indices_resolved = topk_ragged_indices
+    extra_ragged_indptr_resolved = topk_ragged_indptr
+    if use_unified or use_flydsl:
+        (
+            swa_ragged_indices,
+            swa_ragged_indptr,
+            extra_ragged_indices_resolved,
+            extra_ragged_indptr_resolved,
+        ) = _resolve_decode_ragged(
+            main_indices,
+            swa_ragged_indices,
+            swa_ragged_indptr,
+            swa_lens,
+            swa_k_cache,
+            extra_cache,
+            extra_indices,
+            topk_ragged_indices,
+            topk_ragged_indptr,
+            topk_lens,
+        )
+
+    # Branch 1: unified-KV path via the generic aiter pa_decode_sparse kernel.
+    if use_unified:
+        try:
+            attn_out = _rocm_sparse_attn_decode_unified_pa(
+                q=q,
+                main_cache=swa_k_cache,
+                main_ragged_indices=swa_ragged_indices,
+                main_ragged_indptr=swa_ragged_indptr,
+                scale=scale,
+                attn_sink=sink,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                extra_cache=extra_cache,
+                extra_ragged_indices=extra_ragged_indices_resolved,
+                extra_ragged_indptr=extra_ragged_indptr_resolved,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _UNIFIED_PA_DECODE_FN = None
+            from vllm.logger import init_logger
+
+            init_logger(__name__).warning(
+                "[unified-pa-decode] runtime failure, disabling unified-KV "
+                "decode and falling back to Triton: %r",
+                exc,
+            )
+            attn_out = None
+
+    # Branch 2: FlyDSL fused dual-cache kernel.
+    if attn_out is None and use_flydsl:
+        try:
+            attn_out = _rocm_sparse_attn_decode_flydsl_fused(
+                q=q,
+                main_cache=swa_k_cache,
+                main_ragged_indices=swa_ragged_indices,
+                main_ragged_indptr=swa_ragged_indptr,
+                scale=scale,
+                attn_sink=sink,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                extra_cache=extra_cache,
+                extra_ragged_indices=extra_ragged_indices_resolved,
+                extra_ragged_indptr=extra_ragged_indptr_resolved,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # First call runs eagerly during warmup (before cudagraph capture);
+            # a compile/exec failure there disables the FlyDSL path permanently
+            # and falls back to the Triton split-K decode for correctness.
+            _FLYDSL_FUSED_DECODE_FN = None
+            from vllm.logger import init_logger
+
+            init_logger(__name__).warning(
+                "[flydsl-decode] runtime failure, disabling FlyDSL decode and "
+                "falling back to Triton: %r",
+                exc,
+            )
+            attn_out = None
+
+    # Branch 3 (fallback): Triton split-K decode.
+    if attn_out is None:
+        attn_out = _rocm_sparse_attn_decode_triton(
+            q=q,
+            main_cache=swa_k_cache,
+            main_indices=main_indices,
+            scale=scale,
+            attn_sink=sink,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            main_lengths=swa_lens,
+            extra_lengths=topk_lens,
+            main_ragged_indices=swa_ragged_indices,
+            main_ragged_indptr=swa_ragged_indptr,
+            extra_ragged_indices=topk_ragged_indices,
+            extra_ragged_indptr=topk_ragged_indptr,
+        )
     output.copy_(attn_out.to(output.dtype))
